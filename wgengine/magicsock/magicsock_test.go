@@ -4369,3 +4369,52 @@ func TestReceiveTSMPDiscoKeyAdvertisement(t *testing.T) {
 		t.Errorf("New disco key %s, does not match %s", newDiscoKey.ShortString(), ep.disco.Load().short)
 	}
 }
+
+// TestUpdateNetInfoNoV4Send checks that a netcheck which attempted no IPv4
+// send leaves noV4Send clear. Setting it makes updateEndpoints rebind on every
+// netcheck for as long as the link has no IPv4, dropping DERP conns each time.
+func TestUpdateNetInfoNoV4Send(t *testing.T) {
+	tests := []struct {
+		name     string
+		stunAddr string
+		sendErr  error
+		want     bool
+	}{
+		// The IPv4 socket was exercised and failed, which is what a rebind
+		// exists to recover from.
+		{"v4_send_fails", "127.0.0.1:3478", errors.New("sendto: network is unreachable"), true},
+		{"v4_send_ok", "127.0.0.1:3478", nil, false},
+		// No DERP node has an IPv4 address, so no IPv4 probe is planned and
+		// the IPv4 socket is never exercised.
+		{"no_v4_probe", "[::1]:3478", nil, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Each case waits out netcheck's STUN probe timeout.
+			t.Parallel()
+
+			conn := newTestConn(t)
+			t.Cleanup(func() { conn.Close() })
+			// Populate the map without starting an unrelated asynchronous netcheck.
+			dm := stuntest.DERPMapOf(tt.stunAddr)
+			conn.mu.Lock()
+			conn.derpMap = dm
+			conn.derpMapAtomic.Store(dm)
+			conn.mu.Unlock()
+			conn.netChecker.SendPacket = func(pkt []byte, dst netip.AddrPort) (int, error) {
+				if tt.sendErr != nil {
+					return 0, tt.sendErr
+				}
+				return len(pkt), nil
+			}
+
+			if _, err := conn.updateNetInfo(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if got := conn.noV4Send.Load(); got != tt.want {
+				t.Errorf("noV4Send = %v; want %v", got, tt.want)
+			}
+		})
+	}
+}
